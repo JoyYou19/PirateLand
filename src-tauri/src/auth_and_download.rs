@@ -184,6 +184,7 @@ impl AuthenticatedClient {
             let manager = TORRENT_MANAGER.lock().await;
             if let Some(manager) = manager.as_ref() {
                 manager
+                    .clone()
                     .add_torrent(&output_path, game_title)
                     .await
                     .map_err(|e| format!("Failed to add torrent: {}", e))?;

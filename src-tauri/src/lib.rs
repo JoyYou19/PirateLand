@@ -246,11 +246,24 @@ pub fn run() {
             }
         }
 
-        // Initialize torrent manager
-        let downloads_dir = format!(
-            "{}/Downloads/PirateLand",
-            std::env::var("USERPROFILE").unwrap()
-        );
+        // Initialize torrent manager with platform-specific download directory
+        let downloads_dir = if cfg!(target_os = "windows") {
+            format!(
+                "{}/Downloads/PirateLand",
+                std::env::var("USERPROFILE").unwrap()
+            )
+        } else {
+            // Linux: Use ~/Downloads/PirateLand or XDG_DOWNLOAD_DIR if set
+            let base_dir = std::env::var("XDG_DOWNLOAD_DIR")
+                .unwrap_or_else(|_| format!("{}/Downloads", std::env::var("HOME").unwrap()));
+            format!("{}/PirateLand", base_dir)
+        };
+
+        // Create the directory if it doesn't exist
+        tokio::fs::create_dir_all(&downloads_dir)
+            .await
+            .expect("Failed to create download directory");
+
         let manager = TorrentManager::new(downloads_dir.into())
             .await
             .expect("Failed to create torrent manager");
@@ -374,11 +387,18 @@ async fn get_installed_games() -> Result<Vec<InstalledGame>, String> {
     use std::fs;
     use std::path::PathBuf;
 
-    // Define the games directory
-    let games_dir = format!(
-        "{}/Downloads/PirateLand",
-        std::env::var("USERPROFILE").unwrap()
-    );
+    // Define the games directory based on platform
+    let games_dir = if cfg!(target_os = "windows") {
+        format!(
+            "{}/Downloads/PirateLand",
+            std::env::var("USERPROFILE").unwrap()
+        )
+    } else {
+        // Linux: Use XDG_DOWNLOAD_DIR if available, otherwise ~/Downloads
+        let base_dir = std::env::var("XDG_DOWNLOAD_DIR")
+            .unwrap_or_else(|_| format!("{}/Downloads", std::env::var("HOME").unwrap()));
+        format!("{}/PirateLand", base_dir)
+    };
 
     // Check if the directory exists
     let dir_path = PathBuf::from(&games_dir);
@@ -394,15 +414,44 @@ async fn get_installed_games() -> Result<Vec<InstalledGame>, String> {
                 if let Ok(entry) = entry {
                     let path = entry.path();
                     if path.is_dir() {
-                        if let Some(folder_name) = path.file_name().and_then(|n| n.to_str()) {
-                            // Construct the "Extracted" subfolder path
+                        if let Some(folder_name) = path.clone().file_name().and_then(|n| n.to_str())
+                        {
+                            // Check for extracted games
                             let extracted_path = path.join("Extracted");
+                            let game_path = if extracted_path.exists() && extracted_path.is_dir() {
+                                extracted_path
+                            } else {
+                                // Also include the directory itself if it contains game files
+                                path
+                            };
 
-                            // Check if the "Extracted" subfolder exists
-                            if extracted_path.exists() && extracted_path.is_dir() {
+                            // Check if the directory contains any game files (exe, so, bin, etc.)
+                            let has_game_files = fs::read_dir(&game_path)
+                                .ok()
+                                .map(|entries| {
+                                    entries.filter_map(|e| e.ok()).any(|e| {
+                                        let p = e.path();
+                                        if p.is_file() {
+                                            let ext = p
+                                                .extension()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("")
+                                                .to_lowercase();
+                                            match ext.as_str() {
+                                                "exe" | "so" | "bin" | "appimage" | "sh" => true,
+                                                _ => false,
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                })
+                                .unwrap_or(false);
+
+                            if has_game_files {
                                 installed_games.push(InstalledGame {
                                     name: folder_name.to_string(),
-                                    path: extracted_path.to_string_lossy().to_string(),
+                                    path: game_path.to_string_lossy().to_string(),
                                 });
                             }
                         }

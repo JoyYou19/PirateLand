@@ -1,3 +1,4 @@
+use anyhow::Context;
 use librqbit::{
     api::LiveStats, AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions,
     TorrentStats,
@@ -5,11 +6,15 @@ use librqbit::{
 use std::{
     cell::RefCell,
     collections::HashMap,
+    fs,
+    io::Cursor,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
+use tauri::async_runtime::spawn_blocking;
 use tokio::sync::{Mutex, RwLock};
+use unrar::Archive;
 
 use crate::DownloadProgress;
 
@@ -18,6 +23,10 @@ pub struct TorrentInfo {
     pub game_title: String,
     pub torrent_path: String,
     pub added_at: Instant,
+    pub extracted: bool,
+    pub extraction_started: bool,
+    pub extract_progress: f64,
+    pub extraction_error: Option<String>,
 }
 
 pub struct TorrentManager {
@@ -46,7 +55,7 @@ impl TorrentManager {
     }
 
     pub async fn add_torrent(
-        &self,
+        self: Arc<Self>,
         torrent_path: &str,
         game_title: &str,
     ) -> anyhow::Result<Arc<ManagedTorrent>> {
@@ -70,15 +79,71 @@ impl TorrentManager {
 
         let id = handle.id();
 
-        let mut torrents = self.torrents.write().await;
-        torrents.insert(
-            id as u64,
-            TorrentInfo {
-                game_title: game_title.to_string(),
-                torrent_path: torrent_path.to_string(),
-                added_at: Instant::now(),
-            },
-        );
+        // Insert into torrents map first
+        {
+            let mut torrents = self.torrents.write().await;
+            torrents.insert(
+                id as u64,
+                TorrentInfo {
+                    game_title: game_title.to_string(),
+                    torrent_path: torrent_path.to_string(),
+                    added_at: Instant::now(),
+                    extracted: false,
+                    extraction_started: false,
+                    extract_progress: 0.0,
+                    extraction_error: None,
+                },
+            );
+        }
+
+        // Spawn monitoring task using Arc for shared manager
+        let manager = self.clone();
+        let handle_clone = handle.clone();
+        let game_title = game_title.to_string();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let stats = handle_clone.stats();
+
+                if stats.finished {
+                    let game_dir = manager.download_dir.join(&game_title);
+
+                    // Mark extraction as started
+                    {
+                        let mut torrents = manager.torrents.write().await;
+                        if let Some(info) = torrents.get_mut(&(id as u64)) {
+                            info.extraction_started = true;
+                        }
+                    }
+
+                    // Extract archives with progress tracking
+                    match manager
+                        .extract_archives_in_directory(&game_dir, id as u64)
+                        .await
+                    {
+                        Ok(_) => {
+                            let mut torrents = manager.torrents.write().await;
+                            if let Some(info) = torrents.get_mut(&(id as u64)) {
+                                info.extracted = true;
+                                info.extract_progress = 1.0;
+                                info.extraction_error = None;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to extract archives for {}: {}", game_title, e);
+                            let mut torrents = manager.torrents.write().await;
+                            if let Some(info) = torrents.get_mut(&(id as u64)) {
+                                info.extraction_error = Some(e.to_string());
+                            }
+                        }
+                    }
+
+                    break;
+                }
+            }
+        });
 
         Ok(handle)
     }
@@ -112,6 +177,88 @@ impl TorrentManager {
         result.into_inner()
     }
 
+    async fn extract_archives_in_directory(
+        &self,
+        dir: &PathBuf,
+        torrent_id: u64,
+    ) -> anyhow::Result<()> {
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(()); // Directory doesn't exist yet
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // First count all archive files
+        let mut archive_files = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if entry.metadata().await?.is_file() {
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    match ext.to_lowercase().as_str() {
+                        "rar" | "zip" => archive_files.push(path),
+                        _ => continue,
+                    }
+                }
+            }
+        }
+
+        let total_files = archive_files.len() as f64;
+        if total_files == 0.0 {
+            return Ok(());
+        }
+
+        // Process each archive file and update progress
+        for (i, archive_path) in archive_files.into_iter().enumerate() {
+            let current_progress = (i as f64) / total_files;
+
+            // Update progress
+            {
+                let mut torrents = self.torrents.write().await;
+                if let Some(info) = torrents.get_mut(&torrent_id) {
+                    info.extract_progress = current_progress;
+                }
+            }
+
+            match archive_path.extension().and_then(|s| s.to_str()) {
+                Some("rar") => self.extract_rar(&archive_path, dir).await?,
+                Some("zip") => {} /*self.extract_zip(&archive_path, dir).await?*/,
+                _ => continue,
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn extract_rar(
+        &self,
+        archive_path: &PathBuf,
+        destination: &PathBuf,
+    ) -> anyhow::Result<()> {
+        let archive_path = archive_path.clone();
+        let destination = destination.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut archive = Archive::new(&archive_path).open_for_processing().unwrap();
+
+            while let Some(header) = archive.read_header()? {
+                println!(
+                    "{} bytes: {}",
+                    header.entry().unpacked_size,
+                    header.entry().filename.to_string_lossy(),
+                );
+                archive = if header.entry().is_file() {
+                    header.extract()?
+                } else {
+                    header.skip()?
+                };
+            }
+            Ok(())
+        })
+        .await?
+    }
+
     pub async fn get_torrent_info(&self, id: u64) -> Option<TorrentInfo> {
         self.torrents.read().await.get(&id).cloned()
     }
@@ -136,7 +283,7 @@ fn torrent_stats_to_progress(
     // Extract speed and ETA from LiveStats if available
     let (speed_mb_ps, eta, peers_connected, downloaded) = match &stats.live {
         Some(live) => {
-            let speed_mb_ps = live.download_speed.mbps / 8.0;
+            let speed_mb_ps = live.download_speed.mbps;
 
             let eta = match &live.time_remaining {
                 Some(duration) => duration.to_string(),
