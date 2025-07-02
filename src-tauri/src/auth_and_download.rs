@@ -1,7 +1,9 @@
+use reqwest::header;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use std::{collections::HashMap, error::Error};
-use reqwest::header;
+
+use crate::TORRENT_MANAGER;
 
 pub struct AuthenticatedClient {
     client: Client,
@@ -11,15 +13,17 @@ pub struct AuthenticatedClient {
 impl AuthenticatedClient {
     pub async fn new(cf_clearance: &str, php_sessid: &str) -> Result<Self, Box<dyn Error>> {
         // Use a custom reqwest client builder with HTTP/2 and Rustls
-        let client = reqwest::Client::builder()
-            .build()?;
+        let client = reqwest::Client::builder().build()?;
 
         // Initialize with provided cookies
         let mut cookie_store = HashMap::new();
         cookie_store.insert("cf_clearance".to_string(), cf_clearance.to_string());
         cookie_store.insert("PHPSESSID".to_string(), php_sessid.to_string());
         cookie_store.insert("dle_user_id".to_string(), "1956012".to_string());
-        cookie_store.insert("dle_password".to_string(), "5635960d1de3680613ba0cab35bfcf56".to_string());
+        cookie_store.insert(
+            "dle_password".to_string(),
+            "5635960d1de3680613ba0cab35bfcf56".to_string(),
+        );
         cookie_store.insert("u_e7f652f7be".to_string(), "1".to_string());
         cookie_store.insert("e7f652f7be_delayCount".to_string(), "12".to_string());
 
@@ -52,30 +56,40 @@ impl AuthenticatedClient {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::USER_AGENT,
-            header::HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0"),
+            header::HeaderValue::from_static(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+            ),
         );
         headers.insert(
             header::ACCEPT,
-            header::HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+            header::HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ),
         );
-        headers.insert(header::ACCEPT_LANGUAGE, header::HeaderValue::from_static("en-US,en;q=0.5"));
-        headers.insert(header::ACCEPT_ENCODING, header::HeaderValue::from_static("gzip, deflate, br, zstd"));
-        headers.insert(header::REFERER, header::HeaderValue::from_static("https://online-fix.me/"));
+        headers.insert(
+            header::ACCEPT_LANGUAGE,
+            header::HeaderValue::from_static("en-US,en;q=0.5"),
+        );
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            header::HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
+        headers.insert(
+            header::REFERER,
+            header::HeaderValue::from_static("https://online-fix.me/"),
+        );
 
         // Add cookies as separate headers
         for (cookie_name, cookie_value) in &self.cookie_store {
             let cookie_header = format!("{}={}", cookie_name, cookie_value);
-            headers.insert(header::COOKIE, header::HeaderValue::from_str(&cookie_header)?);
+            headers.insert(
+                header::COOKIE,
+                header::HeaderValue::from_str(&cookie_header)?,
+            );
         }
 
-
         // Send the request
-        let response = self
-            .client
-            .get(&game_url)
-            .headers(headers)
-            .send()
-        .await;
+        let response = self.client.get(&game_url).headers(headers).send().await;
 
         // Handle request errors
         if let Err(err) = response {
@@ -84,23 +98,20 @@ impl AuthenticatedClient {
 
         let response = response.unwrap();
 
-
         // Clone headers and status before consuming the response
         let headers = response.headers().clone();
         let status = response.status();
 
         // Buffer the response body
-        let body = response.text().await.unwrap_or_else(|_| "Unable to fetch body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unable to fetch body".to_string());
 
         // Check for successful status code
         if !status.is_success() {
             println!("Response body for error: {}", body);
-            return Err(format!(
-                "Request failed with status: {}. Body: {}",
-                status,
-                body
-            )
-                .into());
+            return Err(format!("Request failed with status: {}. Body: {}", status, body).into());
         }
 
         // Extract the `Set-Cookie` header from cloned headers
@@ -127,11 +138,7 @@ impl AuthenticatedClient {
     }
 
     /// Use the `online_fix_auth` cookie to download the torrent file
-    pub async fn download_torrent(
-        &self,
-        game_title: &str,
-    ) -> Result<(), Box<dyn Error>> {
-
+    pub async fn download_torrent(&self, game_title: &str) -> Result<(), Box<dyn Error>> {
         // Construct the game-specific URL
         let game_url = format!(
             "https://uploads.online-fix.me:2053/torrents/{}/",
@@ -142,7 +149,6 @@ impl AuthenticatedClient {
         let html = self.fetch_html(&game_url).await?;
         let torrent_file_name = self.parse_torrent_file_name(&html)?;
         let torrent_url = format!("{}/{}", game_url, torrent_file_name);
-
 
         // Determine the default torrents directory
         let torrents_dir = if cfg!(target_os = "windows") {
@@ -167,52 +173,35 @@ impl AuthenticatedClient {
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
             )
             .send()
-        .await?;
-
+            .await?;
 
         if response.status().is_success() {
             let content = response.bytes().await?;
             std::fs::write(&output_path, &content)?;
             println!("Torrent downloaded to {}", output_path);
 
-            // Send the torrent file location to the Go server
-            self.notify_go_server(&output_path, &game_title).await?;
+            // ✅ Add torrent directly instead of sending to Go server
+            let manager = TORRENT_MANAGER.lock().await;
+            if let Some(manager) = manager.as_ref() {
+                manager
+                    .add_torrent(&output_path, game_title)
+                    .await
+                    .map_err(|e| format!("Failed to add torrent: {}", e))?;
+            } else {
+                return Err("Torrent manager not initialized".into());
+            }
             Ok(())
         } else {
-            Err(format!(
-                "Failed to download torrent: {}",
-                response.status()
-            )
-                .into())
+            Err(format!("Failed to download torrent: {}", response.status()).into())
         }
     }
 
     /// Notify the Go server about the downloaded torrent
-    async fn notify_go_server(&self, torrent_file_path: &str, game_title: &str) -> Result<(), Box<dyn Error>> {
-        let go_server_url = "http://localhost:8091/upload-torrent";
-
-        let response = self
-            .client
-            .post(go_server_url)
-            .json(&serde_json::json!({ "file_path": torrent_file_path, "game_title": game_title }))
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            println!("Successfully notified Go server about torrent file.");
-            Ok(())
-        } else {
-            Err(format!(
-                "Failed to notify Go server: {}",
-                response.status()
-            )
-            .into())
-        }
-    }
-
-
-    /// Notify the Go server about the downloaded torrent
-    pub async fn drop_torrent(&self, torrent_file_path: &str, game_title: &str) -> Result<(), Box<dyn Error>> {
+    pub async fn drop_torrent(
+        &self,
+        torrent_file_path: &str,
+        game_title: &str,
+    ) -> Result<(), Box<dyn Error>> {
         let go_server_url = "http://localhost:8091/drop-torrent";
 
         let response = self
@@ -226,25 +215,22 @@ impl AuthenticatedClient {
             println!("Successfully notified Go server about torrent file.");
             Ok(())
         } else {
-            Err(format!(
-                "Failed to notify Go server: {}",
-                response.status()
-            )
-            .into())
+            Err(format!("Failed to notify Go server: {}", response.status()).into())
         }
     }
 
     /// Fetch the HTML of the given URL
     async fn fetch_html(&self, url: &str) -> Result<String, Box<dyn Error>> {
-
         let response = self
             .client
             .get(url)
             .header("Cookie", self.construct_cookie_header())
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+            )
             .send()
-        .await?;
-
+            .await?;
 
         if response.status().is_success() {
             let html = response.text().await?;
@@ -256,7 +242,6 @@ impl AuthenticatedClient {
 
     /// Parse the torrent file name from HTML
     fn parse_torrent_file_name(&self, html: &str) -> Result<String, Box<dyn Error>> {
-
         let document = Html::parse_document(html);
         let link_selector = Selector::parse("a").unwrap();
 

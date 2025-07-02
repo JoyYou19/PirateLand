@@ -25,7 +25,6 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "go-rain-server/go-rain-server.exe",
       "steam_games.json"
     ],
     "icon": [

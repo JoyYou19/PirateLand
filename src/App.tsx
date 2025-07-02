@@ -4,16 +4,21 @@ import GameDetails from "./GameDetails";
 import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
 import Downloads from "./Downloads";
 import InstalledGames from "./Library";
+import { useState } from "react";
+import LogViewer from "./LogViewer";
 //import { invoke } from "@tauri-apps/api/core";
 //import { useEffect } from "react";
 
 function App() {
+  const [showLogs, setShowLogs] = useState(false);
   return (
     <Router>
+
+      <LogViewer isOpen={showLogs} onClose={() => setShowLogs(false)} />
       <main className="bg-neutral-950 min-h-screen text-white grid grid-cols-[250px,1fr]">
         {/* Sidebar */}
         <div className="sticky top-0 h-screen">
-          <SidePanel />
+          <SidePanel setShowLogs={setShowLogs}/>
         </div>
 
         {/* Main Content Area */}

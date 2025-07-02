@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import  { useEffect, useRef, useState } from "react";
 import logo from "./assets/pirate_land_icon.svg";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -12,7 +12,7 @@ interface GameDetailsData {
   header_image?: string;
 }
 
-const SidePanel: React.FC = () => {
+const SidePanel = ({ setShowLogs }: { setShowLogs: (show: boolean) => void }) => {
   const navigate = useNavigate();
   const [recentGames, setRecentGames] = useState<RecentGame[]>([]);
   const [defenderExcluded, setDefenderExcluded] = useState<boolean>(true);

@@ -1,5 +1,6 @@
 use config::{load_config, save_config, save_game_image_to_config, RecentGameEntry};
 use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use scrapers::scrape_games;
@@ -19,11 +20,6 @@ use tauri::{Window, WindowEvent};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
-lazy_static! {
-    static ref GO_SERVER_PROCESS: Arc<std::sync::Mutex<Option<Child>>> =
-        Arc::new(std::sync::Mutex::new(None));
-}
-
 // Shared authenticated client
 static AUTH_CLIENT: once_cell::sync::Lazy<
     Arc<Mutex<Option<auth_and_download::AuthenticatedClient>>>,
@@ -31,12 +27,17 @@ static AUTH_CLIENT: once_cell::sync::Lazy<
 
 static STEAM_GAME_STORE: once_cell::sync::Lazy<Arc<Mutex<SteamGameStore>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(SteamGameStore::new())));
+use torrent_manager::TorrentManager;
+
+static TORRENT_MANAGER: Lazy<Arc<Mutex<Option<Arc<TorrentManager>>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
 // The main lib file that is the main entry for the app
 mod auth_and_download;
 mod config;
 mod proxy;
 mod scrapers;
 mod steamapi;
+mod torrent_manager;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -114,13 +115,16 @@ async fn open_folder(folder_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn drop_torrent(torrent_file_path: String) -> Result<String, String> {
-    let mut auth_client = AUTH_CLIENT.lock().await;
-    if let Some(client) = auth_client.as_mut() {
-        let _ = client.drop_torrent(&torrent_file_path, "").await;
-        return Ok(format!("Torrent dropped successfully"));
+async fn drop_torrent(id: u64) -> Result<(), String> {
+    let manager = TORRENT_MANAGER.lock().await;
+    if let Some(manager) = manager.as_ref() {
+        manager
+            .remove_torrent(id)
+            .await
+            .map_err(|e| format!("Failed to remove torrent: {}", e))
+    } else {
+        Err("Torrent manager not initialized".to_string())
     }
-    return Err(format!("Failed to drop torrent",));
 }
 
 #[tauri::command]
@@ -129,37 +133,24 @@ async fn download_torrent(game_title: String) -> Result<String, String> {
     if let Some(client) = auth_client.as_mut() {
         println!("Preparing to download torrent for game: {}", game_title);
 
-        // Ensure the `online_fix_auth` cookie is fetched for the game
-        match client.fetch_online_fix_auth(&game_title).await {
-            Ok(_) => {
-                println!(
-                    "Successfully fetched `online_fix_auth` cookie for {}",
-                    game_title
-                );
-            }
-            Err(e) => {
-                println!(
-                    "Failed to fetch `online_fix_auth` cookie for {}: {}",
+        client
+            .fetch_online_fix_auth(&game_title)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to fetch online_fix_auth cookie for {}: {}",
                     game_title, e
-                );
-                return Err(format!("Failed to fetch `online_fix_auth` cookie: {}", e));
-            }
-        }
+                )
+            })?;
 
-        // Download the torrent file
-        match client.download_torrent(&game_title).await {
-            Ok(_) => {
-                println!("Torrent downloaded successfully");
-                Ok(format!("Torrent downloaded successfully"))
-            }
-            Err(e) => {
-                println!("Failed to download torrent for {}: {}", game_title, e);
-                Err(format!("Failed to download torrent: {}", e))
-            }
-        }
+        client
+            .download_torrent(&game_title)
+            .await
+            .map_err(|e| format!("Failed to download torrent for {}: {}", game_title, e))?;
+
+        Ok("Torrent added successfully".to_string())
     } else {
-        println!("No authenticated client found. Please authenticate first.");
-        Err("No authenticated client found. Please authenticate first.".to_string())
+        Err("Not authenticated".to_string())
     }
 }
 
@@ -215,26 +206,27 @@ async fn find_and_get_game_details_library(query: String) -> Result<Option<GameD
     }
 }
 
-#[tauri::command]
-async fn get_downloads() -> Result<Vec<DownloadProgress>, String> {
-    let response = reqwest::get("http://localhost:8091/downloads-progress")
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let downloads: Vec<DownloadProgress> = response.json().await.map_err(|e| e.to_string())?;
-    Ok(downloads)
-}
-
 #[derive(serde::Serialize, Deserialize, Debug)]
-struct DownloadProgress {
+pub struct DownloadProgress {
+    id: u64,
     name: String,
-    progress: f64,        // Value between 0.0 and 1.0
-    speed_mb_ps: f64,     // Download speed in MB/s
-    peers_connected: u32, // Number of connected peers
+    progress: f64,
+    speed_mb_ps: f64,
+    peers_connected: u32,
     downloaded: i64,
     total_size: i64,
     extract_progress: f64,
     eta: String,
+}
+
+#[tauri::command]
+async fn get_downloads() -> Result<Vec<DownloadProgress>, String> {
+    let manager = TORRENT_MANAGER.lock().await;
+    if let Some(manager) = manager.as_ref() {
+        Ok(manager.list_torrents().await)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -253,14 +245,18 @@ pub fn run() {
                 eprintln!("Failed to load Steam games: {}", err);
             }
         }
+
+        // Initialize torrent manager
+        let downloads_dir = format!(
+            "{}/Downloads/PirateLand",
+            std::env::var("USERPROFILE").unwrap()
+        );
+        let manager = TorrentManager::new(downloads_dir.into())
+            .await
+            .expect("Failed to create torrent manager");
+        *TORRENT_MANAGER.lock().await = Some(Arc::new(manager));
     });
     create_default_directories();
-    // Start the Go server and store its handle
-    let go_server_handle = start_go_server().expect("Failed to start Go server");
-    {
-        let mut go_server = GO_SERVER_PROCESS.lock().unwrap(); // No .await required
-        *go_server = Some(go_server_handle);
-    }
     // Spawn the proxy server inside the runtime
     runtime.spawn(async {
         proxy::start_proxy().await;
@@ -287,16 +283,6 @@ pub fn run() {
             drop_torrent,
             uninstall_game,
         ])
-        .on_window_event(|window: &Window, event: &WindowEvent| {
-            if let WindowEvent::CloseRequested { .. } = event {
-                // When the window is closed, stop the Go server
-                let mut go_server = GO_SERVER_PROCESS.lock().unwrap();
-                if let Some(mut process) = go_server.take() {
-                    let _ = process.kill(); // Kill the process
-                    println!("Go server process killed");
-                }
-            }
-        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

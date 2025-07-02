@@ -1,12 +1,12 @@
+use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use anyhow::Result;
 use strsim::jaro_winkler;
+use tokio::sync::Mutex;
 
 // Define the structure to parse the API response
 #[derive(Serialize, Clone, Deserialize, Debug)]
@@ -49,6 +49,7 @@ pub struct GameDetails {
     pub about_the_game: Option<String>,
     pub screenshots: Option<Vec<Screenshot>>,
     pub genres: Option<Vec<Genre>>,
+    pub pc_requirements: Option<PCRequirements>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -74,17 +75,29 @@ pub struct Genre {
     pub description: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct PCRequirements {
+    pub minimum: Option<String>,
+    pub recommended: Option<String>,
+}
+
 pub async fn fetch_game_details(appid: u32) -> Result<GameDetails, Box<dyn std::error::Error>> {
-    let url = format!("https://store.steampowered.com/api/appdetails?appids={}", appid);
+    let url = format!(
+        "https://store.steampowered.com/api/appdetails?appids={}",
+        appid
+    );
     let response = reqwest::get(&url).await?;
     let response_json: serde_json::Value = response.json().await?;
 
     // Print the raw JSON response for debugging
 
     // Parse the response for the specific appid
-    if response_json[appid.to_string()]["success"].as_bool().unwrap_or(false) {
+    if response_json[appid.to_string()]["success"]
+        .as_bool()
+        .unwrap_or(false)
+    {
         let data = &response_json[appid.to_string()]["data"];
-        
+
         // Print the extracted data for additional context
 
         // Deserialize into the GameDetails struct

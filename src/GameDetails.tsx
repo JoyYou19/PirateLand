@@ -23,6 +23,11 @@ interface Genre {
   description?: string;
 }
 
+interface PCRequirements {
+  minimum?: string;
+  recommended?: string;
+}
+
 interface GameDetailsData {
   name?: string;
   short_description?: string;
@@ -34,6 +39,7 @@ interface GameDetailsData {
   about_the_game?: string;
   screenshots?: Screenshot[];
   genres?: Genre[];
+  pc_requirements?: PCRequirements;
 }
 
 const GameDetails = () => {
@@ -305,6 +311,42 @@ const GameDetails = () => {
                   </span>
                 </div>
               )
+            )}
+
+            {/* PC Requirements */}
+            {gameDetails.pc_requirements && (
+              <div className="mt-6">
+                <h3 className="font-bold text-lg mb-3 flex items-center">
+                  <i className="fas fa-desktop mr-2 text-blue-400" />
+                  System Requirements
+                </h3>
+
+                {gameDetails.pc_requirements.minimum && (
+                  <div className="mb-4">
+                    <h4 className="font-semibold text-gray-400 mb-1 flex items-center">
+                      <i className="fas fa-microchip mr-2 text-sm" />
+                      Minimum
+                    </h4>
+                    <div 
+                      className="text-gray-300 text-sm bg-neutral-800 p-3 rounded-lg"
+                      dangerouslySetInnerHTML={{ __html: gameDetails.pc_requirements.minimum }}
+                    />
+                  </div>
+                )}
+
+                {gameDetails.pc_requirements.recommended && (
+                  <div>
+                    <h4 className="font-semibold text-gray-400 mb-1 flex items-center">
+                      <i className="fas fa-tachometer-alt mr-2 text-sm" />
+                      Recommended
+                    </h4>
+                    <div 
+                      className="text-gray-300 text-sm bg-neutral-800 p-3 rounded-lg"
+                      dangerouslySetInnerHTML={{ __html: gameDetails.pc_requirements.recommended }}
+                    />
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </div>
