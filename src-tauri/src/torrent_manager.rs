@@ -27,6 +27,15 @@ pub struct TorrentInfo {
     pub extraction_started: bool,
     pub extract_progress: f64,
     pub extraction_error: Option<String>,
+    state: DownloadState,
+}
+
+#[derive(Debug, Clone)]
+enum DownloadState {
+    Downloading,
+    Extracting,
+    Completed,
+    Failed,
 }
 
 pub struct TorrentManager {
@@ -79,22 +88,20 @@ impl TorrentManager {
 
         let id = handle.id();
 
-        // Insert into torrents map first
-        {
-            let mut torrents = self.torrents.write().await;
-            torrents.insert(
-                id as u64,
-                TorrentInfo {
-                    game_title: game_title.to_string(),
-                    torrent_path: torrent_path.to_string(),
-                    added_at: Instant::now(),
-                    extracted: false,
-                    extraction_started: false,
-                    extract_progress: 0.0,
-                    extraction_error: None,
-                },
-            );
-        }
+        let mut torrents = self.torrents.write().await;
+        torrents.insert(
+            id as u64,
+            TorrentInfo {
+                game_title: game_title.to_string(),
+                torrent_path: torrent_path.to_string(),
+                added_at: Instant::now(),
+                extracted: false,
+                extraction_started: false,
+                extract_progress: 0.0,
+                extraction_error: None,
+                state: DownloadState::Downloading,
+            },
+        );
 
         // Spawn monitoring task using Arc for shared manager
         let manager = self.clone();
@@ -115,6 +122,7 @@ impl TorrentManager {
                         let mut torrents = manager.torrents.write().await;
                         if let Some(info) = torrents.get_mut(&(id as u64)) {
                             info.extraction_started = true;
+                            info.state = DownloadState::Extracting;
                         }
                     }
 
@@ -129,6 +137,7 @@ impl TorrentManager {
                                 info.extracted = true;
                                 info.extract_progress = 1.0;
                                 info.extraction_error = None;
+                                info.state = DownloadState::Completed;
                             }
                         }
                         Err(e) => {
@@ -136,6 +145,7 @@ impl TorrentManager {
                             let mut torrents = manager.torrents.write().await;
                             if let Some(info) = torrents.get_mut(&(id as u64)) {
                                 info.extraction_error = Some(e.to_string());
+                                info.state = DownloadState::Failed;
                             }
                         }
                     }
@@ -166,10 +176,15 @@ impl TorrentManager {
             for (id, managed) in iter {
                 let id = id as u64;
                 if let Some(info) = torrents_map.get(&id) {
-                    let stats = managed.stats();
-                    result
-                        .borrow_mut()
-                        .push(torrent_stats_to_progress(&stats, info, id));
+                    if matches!(
+                        info.state,
+                        DownloadState::Downloading | DownloadState::Extracting
+                    ) {
+                        let stats = managed.stats();
+                        result
+                            .borrow_mut()
+                            .push(torrent_stats_to_progress(&stats, info, id));
+                    }
                 }
             }
         });
@@ -239,17 +254,36 @@ impl TorrentManager {
         let archive_path = archive_path.clone();
         let destination = destination.clone();
 
+        println!("[DEBUG] Starting RAR extraction");
+        println!("[DEBUG] Archive path: {}", archive_path.display());
+        println!("[DEBUG] Destination path: {}", destination.display());
+
         tokio::task::spawn_blocking(move || {
-            let mut archive = Archive::new(&archive_path).open_for_processing().unwrap();
+            println!("[DEBUG] Opening archive...");
+            let mut archive = Archive::with_password(&archive_path, "online-fix.me")
+                .open_for_processing()
+                .unwrap();
 
             while let Some(header) = archive.read_header()? {
+                let filename = header.entry().filename.to_path_buf();
+                let relative_path = filename.iter().skip(1).collect::<PathBuf>();
+                let out_path = destination.join("Extracted").join(relative_path);
                 println!(
                     "{} bytes: {}",
                     header.entry().unpacked_size,
                     header.entry().filename.to_string_lossy(),
                 );
                 archive = if header.entry().is_file() {
-                    header.extract()?
+                    // Compose full output path
+                    println!("Extracting file to dest: {}", out_path.display());
+
+                    // Make sure parent dirs exist
+                    if let Some(parent) = out_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+
+                    // Pass full file path to extract_to
+                    header.extract_to(&out_path)?
                 } else {
                     header.skip()?
                 };

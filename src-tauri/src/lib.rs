@@ -223,7 +223,13 @@ pub struct DownloadProgress {
 async fn get_downloads() -> Result<Vec<DownloadProgress>, String> {
     let manager = TORRENT_MANAGER.lock().await;
     if let Some(manager) = manager.as_ref() {
-        Ok(manager.list_torrents().await)
+        let active = manager.list_torrents().await;
+        if active.is_empty() {
+            // No active downloads or extractions
+            Ok(Vec::new())
+        } else {
+            Ok(active)
+        }
     } else {
         Ok(Vec::new())
     }
@@ -387,45 +393,59 @@ async fn get_installed_games() -> Result<Vec<InstalledGame>, String> {
     use std::fs;
     use std::path::PathBuf;
 
-    // Define the games directory based on platform
     let games_dir = if cfg!(target_os = "windows") {
         format!(
             "{}/Downloads/PirateLand",
-            std::env::var("USERPROFILE").unwrap()
+            std::env::var("USERPROFILE").unwrap_or_else(|_| {
+                println!("[DEBUG] USERPROFILE env var missing");
+                ".".to_string()
+            })
         )
     } else {
-        // Linux: Use XDG_DOWNLOAD_DIR if available, otherwise ~/Downloads
-        let base_dir = std::env::var("XDG_DOWNLOAD_DIR")
-            .unwrap_or_else(|_| format!("{}/Downloads", std::env::var("HOME").unwrap()));
+        let base_dir = std::env::var("XDG_DOWNLOAD_DIR").unwrap_or_else(|_| {
+            format!(
+                "{}/Downloads",
+                std::env::var("HOME").unwrap_or_else(|_| {
+                    println!("[DEBUG] HOME env var missing");
+                    ".".to_string()
+                })
+            )
+        });
         format!("{}/PirateLand", base_dir)
     };
 
-    // Check if the directory exists
+    println!("[DEBUG] Games directory: {}", games_dir);
     let dir_path = PathBuf::from(&games_dir);
     if !dir_path.exists() {
-        return Ok(vec![]); // Return an empty list if the directory doesn't exist
+        println!("[DEBUG] Games directory does not exist.");
+        return Ok(vec![]);
     }
 
-    // Read all subdirectories in the games directory
     let mut installed_games = Vec::new();
-    match fs::read_dir(dir_path) {
+
+    match fs::read_dir(&dir_path) {
         Ok(entries) => {
             for entry in entries {
                 if let Ok(entry) = entry {
                     let path = entry.path();
+                    println!("[DEBUG] Found folder: {}", path.display());
+
                     if path.is_dir() {
-                        if let Some(folder_name) = path.clone().file_name().and_then(|n| n.to_str())
-                        {
-                            // Check for extracted games
+                        if let Some(folder_name) = path.file_name().and_then(|n| n.to_str()) {
                             let extracted_path = path.join("Extracted");
                             let game_path = if extracted_path.exists() && extracted_path.is_dir() {
+                                println!("[DEBUG] Found Extracted folder inside {}", folder_name);
                                 extracted_path
                             } else {
-                                // Also include the directory itself if it contains game files
-                                path
+                                println!(
+                                    "[DEBUG] No Extracted folder, using folder itself: {}",
+                                    folder_name
+                                );
+                                path.clone()
                             };
 
-                            // Check if the directory contains any game files (exe, so, bin, etc.)
+                            println!("[DEBUG] Checking for game files in {}", game_path.display());
+
                             let has_game_files = fs::read_dir(&game_path)
                                 .ok()
                                 .map(|entries| {
@@ -437,16 +457,27 @@ async fn get_installed_games() -> Result<Vec<InstalledGame>, String> {
                                                 .and_then(|s| s.to_str())
                                                 .unwrap_or("")
                                                 .to_lowercase();
-                                            match ext.as_str() {
-                                                "exe" | "so" | "bin" | "appimage" | "sh" => true,
-                                                _ => false,
-                                            }
+                                            let is_game_file = matches!(
+                                                ext.as_str(),
+                                                "exe" | "so" | "bin" | "appimage" | "sh"
+                                            );
+
+                                            println!(
+                                                "[DEBUG] Found file: {} (ext: {}) => game file? {}",
+                                                p.display(),
+                                                ext,
+                                                is_game_file
+                                            );
+
+                                            is_game_file
                                         } else {
                                             false
                                         }
                                     })
                                 })
                                 .unwrap_or(false);
+
+                            println!("[DEBUG] Has game files: {}", has_game_files);
 
                             if has_game_files {
                                 installed_games.push(InstalledGame {
@@ -459,9 +490,14 @@ async fn get_installed_games() -> Result<Vec<InstalledGame>, String> {
                 }
             }
         }
-        Err(e) => return Err(format!("Failed to read games directory: {}", e)),
+        Err(e) => {
+            let err_msg = format!("Failed to read games directory: {}", e);
+            println!("[DEBUG] {}", err_msg);
+            return Err(err_msg);
+        }
     }
 
+    println!("[DEBUG] Installed games found: {}", installed_games.len());
     Ok(installed_games)
 }
 
