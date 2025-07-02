@@ -22,6 +22,36 @@ var (
 	completedDownloads sync.Map
 )
 
+type ProgressUpdate struct {
+	FilePath string
+	Progress DownloadProgress
+}
+
+type TorrentControl struct {
+	FilePath string
+	Action   string
+}
+
+func progressManager() {
+	progress := make(map[string]DownloadProgress)
+
+	for {
+		select {
+		case update := <-progressUpdates:
+			progress[update.FilePath] = update.Progress
+		case control := <-torrentControl:
+			if control.Action == "remove" {
+				delete(progress, control.FilePath)
+			}
+		}
+	}
+}
+
+var (
+	progressUpdates = make(chan ProgressUpdate, 100)
+	torrentControl  = make(chan TorrentControl, 10)
+)
+
 var downloadProgress = make(map[string]DownloadProgress)
 var progressMutex = &sync.RWMutex{}
 
@@ -260,6 +290,7 @@ func dropTorrentHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	go progressManager()
 	// Determine the default downloads directory
 	dataDir := getDefaultDownloadsDir()
 

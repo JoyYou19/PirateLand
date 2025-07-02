@@ -29,7 +29,7 @@
       "steam_games.json"
     ],
     "icon": [
-      "icons/pico_32x32.png",
+      "icons/pico_32x32_rgba.png",
       "icons/pico_128x128.png",
       "icons/pico_128x128@2x.png",
       "icons/pico.icns",

@@ -1,34 +1,42 @@
 use config::{load_config, save_config, save_game_image_to_config, RecentGameEntry};
+use lazy_static::lazy_static;
+use reqwest::Client;
 use scraper::{Html, Selector};
+use scrapers::scrape_games;
 use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+use std::process::Child;
+use std::{
+    collections::HashMap,
+    io::{self, BufRead},
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::Arc,
+};
 use steamapi::{fetch_game_details, load_steam_games, GameDetails, SteamApp, SteamGameStore};
 use tauri::{Window, WindowEvent};
 use tokio::runtime::Runtime;
-use scrapers::scrape_games;
 use tokio::sync::Mutex;
-use std::process::Child;
-use std::{collections::HashMap, io::{self, BufRead}, path::PathBuf, process::{Command, Stdio}, sync::Arc};
-use std::fs;
-use std::path::Path;
-use reqwest::Client;
-use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref GO_SERVER_PROCESS: Arc<std::sync::Mutex<Option<Child>>> = Arc::new(std::sync::Mutex::new(None));
+    static ref GO_SERVER_PROCESS: Arc<std::sync::Mutex<Option<Child>>> =
+        Arc::new(std::sync::Mutex::new(None));
 }
 
 // Shared authenticated client
-static AUTH_CLIENT: once_cell::sync::Lazy<Arc<Mutex<Option<auth_and_download::AuthenticatedClient>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
+static AUTH_CLIENT: once_cell::sync::Lazy<
+    Arc<Mutex<Option<auth_and_download::AuthenticatedClient>>>,
+> = once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
 static STEAM_GAME_STORE: once_cell::sync::Lazy<Arc<Mutex<SteamGameStore>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(SteamGameStore::new())));
 // The main lib file that is the main entry for the app
-mod scrapers;
-mod proxy;
 mod auth_and_download;
-mod steamapi;
 mod config;
+mod proxy;
+mod scrapers;
+mod steamapi;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -36,7 +44,7 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
-fn fetch_games(page: usize) -> Result<Vec<scrapers::Game>, String>{
+fn fetch_games(page: usize) -> Result<Vec<scrapers::Game>, String> {
     scrape_games(page).map_err(|e| e.to_string())
 }
 
@@ -55,8 +63,16 @@ async fn authenticate(cf_clearance: String, php_sessid: String) -> Result<String
 
 #[tauri::command]
 async fn check_defender_exclusion() -> Result<bool, String> {
-    let config = load_config();
-    Ok(config.defender_excluded)
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Ok(true); // on Linux/macOS, just return true
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let config = load_config();
+        return Ok(config.defender_excluded);
+    }
 }
 
 // Add a helper function to update the Defender exclusion status
@@ -76,7 +92,7 @@ async fn open_folder(folder_path: String) -> Result<(), String> {
         return Err(format!("Folder does not exist: {}", folder_path));
     }
 
-#[cfg(target_os = "windows")]
+    #[cfg(target_os = "windows")]
     Command::new("cmd")
         .args(&["/c", "start", "", &path.to_string_lossy()])
         .spawn()
@@ -98,15 +114,13 @@ async fn open_folder(folder_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn drop_torrent(torrent_file_path: String) -> Result<String,String>{
+async fn drop_torrent(torrent_file_path: String) -> Result<String, String> {
     let mut auth_client = AUTH_CLIENT.lock().await;
     if let Some(client) = auth_client.as_mut() {
         let _ = client.drop_torrent(&torrent_file_path, "").await;
         return Ok(format!("Torrent dropped successfully"));
     }
-    return Err(format!(
-        "Failed to drop torrent",
-    ));
+    return Err(format!("Failed to drop torrent",));
 }
 
 #[tauri::command]
@@ -118,17 +132,17 @@ async fn download_torrent(game_title: String) -> Result<String, String> {
         // Ensure the `online_fix_auth` cookie is fetched for the game
         match client.fetch_online_fix_auth(&game_title).await {
             Ok(_) => {
-                println!("Successfully fetched `online_fix_auth` cookie for {}", game_title);
+                println!(
+                    "Successfully fetched `online_fix_auth` cookie for {}",
+                    game_title
+                );
             }
             Err(e) => {
                 println!(
                     "Failed to fetch `online_fix_auth` cookie for {}: {}",
                     game_title, e
                 );
-                return Err(format!(
-                    "Failed to fetch `online_fix_auth` cookie: {}",
-                    e
-                ));
+                return Err(format!("Failed to fetch `online_fix_auth` cookie: {}", e));
             }
         }
 
@@ -139,10 +153,7 @@ async fn download_torrent(game_title: String) -> Result<String, String> {
                 Ok(format!("Torrent downloaded successfully"))
             }
             Err(e) => {
-                println!(
-                    "Failed to download torrent for {}: {}",
-                    game_title, e
-                );
+                println!("Failed to download torrent for {}: {}", game_title, e);
                 Err(format!("Failed to download torrent: {}", e))
             }
         }
@@ -210,19 +221,16 @@ async fn get_downloads() -> Result<Vec<DownloadProgress>, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let downloads: Vec<DownloadProgress> = response
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let downloads: Vec<DownloadProgress> = response.json().await.map_err(|e| e.to_string())?;
     Ok(downloads)
 }
 
 #[derive(serde::Serialize, Deserialize, Debug)]
 struct DownloadProgress {
     name: String,
-    progress: f64,         // Value between 0.0 and 1.0
-    speed_mb_ps: f64,      // Download speed in MB/s
-    peers_connected: u32,  // Number of connected peers
+    progress: f64,        // Value between 0.0 and 1.0
+    speed_mb_ps: f64,     // Download speed in MB/s
+    peers_connected: u32, // Number of connected peers
     downloaded: i64,
     total_size: i64,
     extract_progress: f64,
@@ -258,10 +266,10 @@ pub fn run() {
         proxy::start_proxy().await;
     });
 
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![greet,
+        .invoke_handler(tauri::generate_handler![
+            greet,
             fetch_games,
             authenticate,
             download_torrent,
@@ -297,10 +305,12 @@ pub fn run() {
 fn update_recent_games(name: String, path: String) {
     let mut config = load_config();
     let new_game = RecentGameEntry { name, path };
-    
+
     // Remove existing entries with the same name or path
-    config.recent_games.retain(|g| g.name != new_game.name && g.path != new_game.path);
-    
+    config
+        .recent_games
+        .retain(|g| g.name != new_game.name && g.path != new_game.path);
+
     config.recent_games.insert(0, new_game);
     config.recent_games.truncate(3);
     save_config(&config);
@@ -348,7 +358,10 @@ fn create_default_directories() {
     };
 
     let downloads_dir = if cfg!(target_os = "windows") {
-        format!("{}/Downloads/PirateLand", std::env::var("USERPROFILE").unwrap())
+        format!(
+            "{}/Downloads/PirateLand",
+            std::env::var("USERPROFILE").unwrap()
+        )
     } else {
         format!("{}/Downloads/PirateLand", std::env::var("HOME").unwrap())
     };
@@ -366,8 +379,8 @@ fn create_default_directories() {
 
 #[derive(serde::Serialize)]
 struct InstalledGame {
-    name: String,       // The name of the game folder
-    path: String,       // The absolute path to the game
+    name: String, // The name of the game folder
+    path: String, // The absolute path to the game
 }
 
 #[tauri::command]
@@ -376,7 +389,10 @@ async fn get_installed_games() -> Result<Vec<InstalledGame>, String> {
     use std::path::PathBuf;
 
     // Define the games directory
-    let games_dir = format!("{}/Downloads/PirateLand", std::env::var("USERPROFILE").unwrap());
+    let games_dir = format!(
+        "{}/Downloads/PirateLand",
+        std::env::var("USERPROFILE").unwrap()
+    );
 
     // Check if the directory exists
     let dir_path = PathBuf::from(&games_dir);
@@ -384,7 +400,7 @@ async fn get_installed_games() -> Result<Vec<InstalledGame>, String> {
         return Ok(vec![]); // Return an empty list if the directory doesn't exist
     }
 
-// Read all subdirectories in the games directory
+    // Read all subdirectories in the games directory
     let mut installed_games = Vec::new();
     match fs::read_dir(dir_path) {
         Ok(entries) => {
@@ -417,7 +433,10 @@ async fn get_installed_games() -> Result<Vec<InstalledGame>, String> {
 #[tauri::command]
 async fn uninstall_game(game_path: String) -> Result<(), String> {
     // Define the parent directory
-    let games_dir = format!("{}/Downloads/PirateLand", std::env::var("USERPROFILE").unwrap());
+    let games_dir = format!(
+        "{}/Downloads/PirateLand",
+        std::env::var("USERPROFILE").unwrap()
+    );
     let games_dir_path = PathBuf::from(&games_dir);
 
     // Ensure the game path is within the games directory for safety
@@ -516,11 +535,11 @@ async fn search_online_fix(query: String) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn exclude_folder_in_defender() -> Result<String, String> {
-    let folder_path = format!("{}/Downloads/PirateLand", std::env::var("USERPROFILE").unwrap());
-    let script = format!(
-        "Add-MpPreference -ExclusionPath \"{}\"",
-        folder_path
+    let folder_path = format!(
+        "{}/Downloads/PirateLand",
+        std::env::var("USERPROFILE").unwrap()
     );
+    let script = format!("Add-MpPreference -ExclusionPath \"{}\"", folder_path);
 
     let output = Command::new("powershell")
         .arg("-Command")
@@ -542,5 +561,5 @@ fn exclude_folder_in_defender() -> Result<String, String> {
             }
         }
         Err(err) => Err(format!("Failed to execute PowerShell: {}", err)),
-}
+    }
 }
