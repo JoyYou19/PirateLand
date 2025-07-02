@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "pirateland",
+  "version": "0.1.0",
+  "identifier": "com.pirateland.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "pirateland",
+        "width": 1600,
+        "height": 900
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "go-rain-server/go-rain-server.exe",
+      "steam_games.json"
+    ],
+    "icon": [
+      "icons/pico_32x32.png",
+      "icons/pico_128x128.png",
+      "icons/pico_128x128@2x.png",
+      "icons/pico.icns",
+      "icons/pico.ico"
+    ]
+  }
+}
