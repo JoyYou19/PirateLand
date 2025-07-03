@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 // Define a type for the download progress data
 interface Download {
+  id: number;
   name: string;
   progress: number; // Progress is a number between 0 and 1
   speed_mb_ps: number; // Download speed in MB/s
@@ -72,11 +73,11 @@ function Downloads() {
   }, [downloads]); // Run whenever downloads update
 
   // Function to drop a torrent
-  const handleDropTorrent = async (name: string) => {
+  const handleDropTorrent = async (id: number) => {
     try {
-      await invoke("drop_torrent", { torrentFilePath: name });
-      console.log(`Dropped torrent: ${name}`);
-      setDownloads((prev) => prev.filter((download) => download.name !== name)); // Remove from list
+      await invoke("drop_torrent", { id: id });
+      console.log(`Dropped torrent: ${id}`);
+      //setDownloads((prev) => prev.filter((download) => download.name !== name)); // Remove from list
     } catch (error) {
       console.error(`Failed to drop torrent ${name}:`, error);
     }
@@ -159,7 +160,7 @@ function Downloads() {
 
                 {/* Drop Torrent Button */}
                 <button
-                  onClick={() => handleDropTorrent(download.name)}
+                  onClick={() => handleDropTorrent(download.id)}
                   className=" text-red-500 hover:text-red-700"
                   title="Remove Download"
                 >

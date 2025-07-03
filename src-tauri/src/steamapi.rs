@@ -1,6 +1,9 @@
 use anyhow::Result;
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -181,13 +184,24 @@ impl SteamGameStore {
     }
 }
 
+#[derive(Deserialize)]
+struct SteamGamesFile {
+    #[serde(flatten)]
+    games: HashMap<String, SteamApp>,
+}
+
 /// Asynchronously load Steam games into the global store
-pub async fn load_steam_games(file_path: &str) -> Result<Arc<Mutex<SteamGameStore>>> {
+pub async fn load_steam_games(
+    file_path: &str,
+) -> Result<Arc<Mutex<SteamGameStore>>, Box<dyn std::error::Error>> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
 
-    // Deserialize the JSON directly into a Vec<SteamApp>
-    let mut games: Vec<SteamApp> = serde_json::from_reader(reader)?;
+    // Deserialize into the wrapper struct
+    let wrapper: SteamGamesFile = serde_json::from_reader(reader)?;
+
+    // Extract the games and convert to Vec
+    let mut games: Vec<SteamApp> = wrapper.games.into_values().collect();
 
     // Compute `name_lower` for each game
     for game in &mut games {
@@ -202,4 +216,153 @@ pub async fn load_steam_games(file_path: &str) -> Result<Arc<Mutex<SteamGameStor
     }
 
     Ok(game_store)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteamGame {
+    pub appid: String,
+    pub name: String,
+    pub header_image: String,
+    pub recommendations: u32,
+    pub positive: u32,
+    pub negative: u32,
+}
+
+pub struct SteamGameStoreIndex {
+    pub games: Arc<Mutex<HashMap<String, SteamGame>>>,
+    pub sorted_recommended: Vec<String>,
+    pub sorted_reviewed: Vec<String>,
+    pub search_index: HashMap<String, String>,
+}
+
+impl SteamGameStoreIndex {
+    pub fn new() -> Self {
+        Self {
+            games: Arc::new(Mutex::new(HashMap::new())),
+            sorted_recommended: Vec::new(),
+            sorted_reviewed: Vec::new(),
+            search_index: HashMap::new(),
+        }
+    }
+
+    pub async fn load_games(&mut self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::open(file_path)?;
+        let reader = BufReader::new(file);
+        let index: HashMap<String, GameIndexEntry> = serde_json::from_reader(reader)?;
+
+        let mut games = HashMap::new();
+        for (appid, entry) in index {
+            games.insert(
+                appid.clone(),
+                SteamGame {
+                    appid: appid.clone(),
+                    name: entry.name,
+                    header_image: entry.header_image,
+                    recommendations: entry.recommendations,
+                    positive: entry.positive,
+                    negative: entry.negative,
+                },
+            );
+        }
+
+        // Create sorted lists
+        let mut all_games: Vec<_> = games.values().collect();
+
+        // Sort by recommendations
+        all_games.sort_by(|a, b| b.recommendations.cmp(&a.recommendations));
+        self.sorted_recommended = all_games.iter().map(|g| g.appid.clone()).collect();
+
+        // Sort by review score (positive ratio)
+        all_games.sort_by(|a, b| {
+            let score_a = a.positive as f32 / (a.positive + a.negative).max(1) as f32;
+            let score_b = b.positive as f32 / (b.positive + b.negative).max(1) as f32;
+            score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal)
+        });
+        self.sorted_reviewed = all_games.iter().map(|g| g.appid.clone()).collect();
+
+        // Update the games map
+        let mut games_map = self.games.lock().await;
+        *games_map = games.clone();
+
+        // Create search index
+        let mut search_index = HashMap::new();
+        for (appid, game) in &games {
+            let normalized = normalize_title(&game.name);
+            // Only index reasonably long titles
+            if normalized.len() >= 5 {
+                search_index.insert(normalized, appid.clone());
+            }
+        }
+        self.search_index = search_index;
+
+        Ok(())
+    }
+
+    pub async fn get_games(&self, category: &str, page: usize, page_size: usize) -> Vec<SteamGame> {
+        let games_map = self.games.lock().await;
+
+        let sorted_list = match category {
+            "most_recommended" => &self.sorted_recommended,
+            "best_reviewed" => &self.sorted_reviewed,
+            _ => return Vec::new(),
+        };
+
+        sorted_list
+            .iter()
+            .skip(page * page_size)
+            .take(page_size)
+            .filter_map(|appid| games_map.get(appid).cloned())
+            .collect()
+    }
+
+    pub fn find_best_match_sync(&self, title: &str) -> Option<SteamGame> {
+        let normalized = normalize_title(title);
+        if normalized.len() < 5 {
+            return None;
+        }
+
+        let games = self.games.blocking_lock(); // Use blocking_lock to avoid async
+        let matcher = SkimMatcherV2::default();
+        let mut best_match = None;
+        let mut best_score = 0;
+
+        // Exact match
+        if let Some(appid) = self.search_index.get(&normalized) {
+            if let Some(game) = games.get(appid) {
+                return Some(game.clone());
+            }
+        }
+
+        // Fuzzy
+        for (norm_title, appid) in &self.search_index {
+            if let Some(score) = matcher.fuzzy_match(norm_title, &normalized) {
+                if score > best_score && score > 70 {
+                    best_score = score;
+                    best_match = games.get(appid).cloned();
+                }
+            }
+        }
+
+        best_match
+    }
+}
+
+#[derive(Deserialize)]
+struct GameIndexEntry {
+    name: String,
+    header_image: String,
+    recommendations: u32,
+    positive: u32,
+    negative: u32,
+}
+
+// Helper function to normalize game titles for comparison
+fn normalize_title(title: &str) -> String {
+    title
+        .to_lowercase()
+        .replace(|c: char| !c.is_alphanumeric(), "")
+        .replace("onlinefix", "")
+        .replace("crack", "")
+        .trim()
+        .to_string()
 }

@@ -1,6 +1,6 @@
 import Skeleton from "react-loading-skeleton";
 import "react-loading-skeleton/dist/skeleton.css";
-import { useParams } from "react-router-dom";
+import { useLocation, useParams } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Screenshots from "./Screenshots";
@@ -48,15 +48,26 @@ const GameDetails = () => {
   const [loading, setLoading] = useState(true); // Track loading state
   const [defenderExcluded, setDefenderExcluded] = useState<boolean>(true);
   const [status, setStatus] = useState("Install"); // Tracks button text
+  const location = useLocation();
+  const [source, setSource] = useState<string>();
+  const [gameUrl, setGameUrl] = useState("");
 
   const handleDownload = async (gameTitle: string) => {
     setStatus("Downloading...");
 
     try {
-      const result = await invoke<string>("download_torrent", { gameTitle });
-
-      // If successful, set a success message
-      console.log("Download result:", result);
+      if (source === "online-fix") {
+        const result = await invoke<string>("download_torrent", { gameTitle });
+        // If successful, set a success message
+        console.log("Download result:", result);
+      } else if (source === "igggames") {
+        console.log(gameUrl);
+        const result = await invoke<string>("download_igggames", {
+          url: gameUrl,
+          gameTitle: gameTitle,
+        });
+        console.log("PCGames download result:", result);
+      }
       setStatus("Download Started");
     } catch (error) {
       console.error("Download error:", error);
@@ -81,6 +92,13 @@ const GameDetails = () => {
 
     checkExclusionStatus();
   }, []);
+
+  useEffect(() => {
+    if (location.state) {
+      setSource(location.state.source);
+      setGameUrl(location.state.url);
+    }
+  }, [location]);
 
   useEffect(() => {
     const fetchDetails = async () => {
@@ -327,9 +345,11 @@ const GameDetails = () => {
                       <i className="fas fa-microchip mr-2 text-sm" />
                       Minimum
                     </h4>
-                    <div 
+                    <div
                       className="text-gray-300 text-sm bg-neutral-800 p-3 rounded-lg"
-                      dangerouslySetInnerHTML={{ __html: gameDetails.pc_requirements.minimum }}
+                      dangerouslySetInnerHTML={{
+                        __html: gameDetails.pc_requirements.minimum,
+                      }}
                     />
                   </div>
                 )}
@@ -340,9 +360,11 @@ const GameDetails = () => {
                       <i className="fas fa-tachometer-alt mr-2 text-sm" />
                       Recommended
                     </h4>
-                    <div 
+                    <div
                       className="text-gray-300 text-sm bg-neutral-800 p-3 rounded-lg"
-                      dangerouslySetInnerHTML={{ __html: gameDetails.pc_requirements.recommended }}
+                      dangerouslySetInnerHTML={{
+                        __html: gameDetails.pc_requirements.recommended,
+                      }}
                     />
                   </div>
                 )}

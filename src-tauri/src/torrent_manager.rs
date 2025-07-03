@@ -4,6 +4,7 @@ use librqbit::{
     TorrentStats,
 };
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::HashMap,
     fs,
@@ -61,6 +62,108 @@ impl TorrentManager {
             torrents: RwLock::new(HashMap::new()),
             download_dir,
         })
+    }
+
+    pub async fn add_torrent_magnet(
+        self: Arc<Self>,
+        torrent_url: &str,
+        game_title: &str,
+    ) -> anyhow::Result<Arc<ManagedTorrent>> {
+        log::info!("[TORRENT] Adding torrent for game: {}", game_title);
+        log::debug!("[TORRENT] Magnet URL: {}", torrent_url);
+        let add_torrent = AddTorrent::Url(Cow::Borrowed(torrent_url));
+
+        log::debug!("[TORRENT] Creating torrent handle...");
+        let response = self
+            .session
+            .add_torrent(
+                add_torrent,
+                Some(AddTorrentOptions {
+                    paused: false,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        log::debug!("[TORRENT] Converting to managed handle...");
+        let handle = response.into_handle().ok_or_else(|| {
+            anyhow::anyhow!("Torrent was added as ListOnly and cannot be managed.")
+        })?;
+
+        let id = handle.id();
+
+        log::info!("[TORRENT] Torrent added with ID: {}", id);
+
+        let mut torrents = self.torrents.write().await;
+        torrents.insert(
+            id as u64,
+            TorrentInfo {
+                game_title: game_title.to_string(),
+                torrent_path: "".to_string(),
+                added_at: Instant::now(),
+                extracted: false,
+                extraction_started: false,
+                extract_progress: 0.0,
+                extraction_error: None,
+                state: DownloadState::Downloading,
+            },
+        );
+
+        log::debug!("[TORRENT] Torrent info stored in manager");
+
+        // Spawn monitoring task using Arc for shared manager
+        let manager = self.clone();
+        let handle_clone = handle.clone();
+        let game_title = game_title.to_string();
+
+        tokio::spawn(async move {
+            log::info!("[TORRENT] Starting monitoring task for ID: {}", id);
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let stats = handle_clone.stats();
+
+                if stats.finished {
+                    let game_dir = manager.download_dir.join(&game_title);
+
+                    // Mark extraction as started
+                    {
+                        let mut torrents = manager.torrents.write().await;
+                        if let Some(info) = torrents.get_mut(&(id as u64)) {
+                            info.extraction_started = true;
+                            info.state = DownloadState::Extracting;
+                        }
+                    }
+
+                    // Extract archives with progress tracking
+                    match manager
+                        .extract_archives_in_directory(&game_dir, id as u64)
+                        .await
+                    {
+                        Ok(_) => {
+                            let mut torrents = manager.torrents.write().await;
+                            if let Some(info) = torrents.get_mut(&(id as u64)) {
+                                info.extracted = true;
+                                info.extract_progress = 1.0;
+                                info.extraction_error = None;
+                                info.state = DownloadState::Completed;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to extract archives for {}: {}", game_title, e);
+                            let mut torrents = manager.torrents.write().await;
+                            if let Some(info) = torrents.get_mut(&(id as u64)) {
+                                info.extraction_error = Some(e.to_string());
+                                info.state = DownloadState::Failed;
+                            }
+                        }
+                    }
+
+                    break;
+                }
+            }
+        });
+
+        Ok(handle)
     }
 
     pub async fn add_torrent(

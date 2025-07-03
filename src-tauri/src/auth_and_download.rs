@@ -181,16 +181,21 @@ impl AuthenticatedClient {
             println!("Torrent downloaded to {}", output_path);
 
             // ✅ Add torrent directly instead of sending to Go server
-            let manager = TORRENT_MANAGER.lock().await;
-            if let Some(manager) = manager.as_ref() {
-                manager
-                    .clone()
-                    .add_torrent(&output_path, game_title)
-                    .await
-                    .map_err(|e| format!("Failed to add torrent: {}", e))?;
-            } else {
-                return Err("Torrent manager not initialized".into());
-            }
+            // Get manager clone without holding lock
+            let manager_clone = {
+                let manager = TORRENT_MANAGER.lock().await;
+                if let Some(m) = manager.as_ref() {
+                    m.clone()
+                } else {
+                    return Err("Torrent manager not initialized".into());
+                }
+            };
+
+            // Use clone to add torrent
+            manager_clone
+                .add_torrent(&output_path, game_title)
+                .await
+                .map_err(|e| format!("Failed to add torrent: {}", e))?;
             Ok(())
         } else {
             Err(format!("Failed to download torrent: {}", response.status()).into())

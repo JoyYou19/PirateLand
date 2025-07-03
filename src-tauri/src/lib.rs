@@ -1,13 +1,15 @@
 use config::{load_config, save_config, save_game_image_to_config, RecentGameEntry};
 use lazy_static::lazy_static;
 use once_cell::sync::Lazy;
+use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use scrapers::scrape_games;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::process::Child;
+use std::time::Duration;
 use std::{
     collections::HashMap,
     io::{self, BufRead},
@@ -15,10 +17,14 @@ use std::{
     process::{Command, Stdio},
     sync::Arc,
 };
-use steamapi::{fetch_game_details, load_steam_games, GameDetails, SteamApp, SteamGameStore};
+use steamapi::{
+    fetch_game_details, load_steam_games, GameDetails, SteamApp, SteamGame, SteamGameStore,
+    SteamGameStoreIndex,
+};
 use tauri::{Window, WindowEvent};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 // Shared authenticated client
 static AUTH_CLIENT: once_cell::sync::Lazy<
@@ -31,6 +37,9 @@ use torrent_manager::TorrentManager;
 
 static TORRENT_MANAGER: Lazy<Arc<Mutex<Option<Arc<TorrentManager>>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
+
+pub static STEAM_GAME_STORE_INDEX: Lazy<Arc<Mutex<SteamGameStoreIndex>>> =
+    Lazy::new(|| Arc::new(Mutex::new(SteamGameStoreIndex::new())));
 // The main lib file that is the main entry for the app
 mod auth_and_download;
 mod config;
@@ -155,6 +164,185 @@ async fn download_torrent(game_title: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn download_igggames(url: String, game_title: String) -> Result<String, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    println!("[DEBUG] Starting download process for URL: {}", url);
+
+    // Step 1: Get the game page HTML
+    let game_page = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch game page: {}", e))?
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read game page: {}", e))?;
+
+    println!("[DEBUG] Successfully fetched game page HTML");
+
+    // Process HTML in a blocking task
+    let download_page_url = tokio::task::spawn_blocking(move || {
+        println!("[DEBUG] Parsing game page HTML for download link");
+        let document = Html::parse_document(&game_page);
+        let selector =
+            Selector::parse("p.uk-card a").map_err(|e| format!("Selector error: {}", e))?;
+
+        let elements: Vec<_> = document.select(&selector).collect();
+        println!(
+            "[DEBUG] Found {} elements matching selector 'p.uk-card a'",
+            elements.len()
+        );
+
+        let href = elements
+            .first()
+            .and_then(|element| element.value().attr("href"))
+            .ok_or_else(|| {
+                println!("[ERROR] No download link found in game page");
+                "Download link not found in game page".to_string()
+            })?;
+
+        println!("[DEBUG] Found download page URL: {}", href);
+        Ok::<String, String>(href.to_string())
+    })
+    .await
+    .map_err(|e| format!("Blocking task failed: {}", e))?
+    .map_err(|e| e)?;
+
+    println!("[DEBUG] Found download page URL: {}", download_page_url);
+
+    // Step 2: Fetch the download page HTML
+    let download_page = client
+        .get(&download_page_url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch download page: {}", e))?
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read download page: {}", e))?;
+
+    println!("[DEBUG] Successfully fetched download page HTML");
+
+    // Step 3: Extract the long string from JavaScript
+    let long_string = extract_long_string(&download_page)?;
+    println!(
+        "[DEBUG] Extracted long string ({} chars): {}",
+        long_string.len(),
+        long_string,
+    );
+
+    // Step 4: Process the string like JavaScript does
+    let processed_string = process_string_javascript_style(&long_string);
+    println!(
+        "[DEBUG] Processed string ({} chars): {}",
+        processed_string.len(),
+        &processed_string
+    );
+
+    // Step 5: Construct API URL
+    let api_url = format!(
+        "https://dl1.gamedownloadurl.autos/get-url.php?url={}",
+        processed_string
+    );
+    println!("[DEBUG] API URL: {}", api_url);
+
+    // Wait 5 seconds as the site requires
+    //println!("[DEBUG] Waiting 5 seconds before API request");
+    //sleep(Duration::from_secs(5)).await;
+
+    // Step 6: Fetch the magnet link
+    let magnet_response = client
+        .get(&api_url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch API: {}", e))?
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read API response: {}", e))?;
+
+    println!("[DEBUG] API response: {}", magnet_response);
+
+    // Step 7: Extract magnet link from response
+    let magnet_link = extract_magnet_link(&magnet_response)?;
+    println!("[SUCCESS] Found magnet link: {}", magnet_link);
+
+    // ✅ Add torrent directly instead of sending to Go server
+    // Get a clone of the torrent manager without holding the lock
+    let manager_clone = {
+        let manager = TORRENT_MANAGER.lock().await;
+        if let Some(m) = manager.as_ref() {
+            m.clone()
+        } else {
+            return Err("Torrent manager not initialized".into());
+        }
+    };
+
+    // Use the clone to add the torrent
+    manager_clone
+        .add_torrent_magnet(&magnet_link, &game_title)
+        .await
+        .map_err(|e| format!("Failed to add torrent: {}", e))?;
+    Ok("Download started".to_string())
+}
+
+// Helper functions
+
+fn extract_long_string(html: &str) -> Result<String, String> {
+    // Find the generateDownloadUrl function
+    let re = Regex::new(r"function generateDownloadUrl\(\)\{[^}]*let [^=]+='([^']+)'").unwrap();
+
+    re.captures(html)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+        .ok_or_else(|| "Long string not found in JavaScript".to_string())
+}
+
+fn process_string_javascript_style(s: &str) -> String {
+    let len = s.len();
+    let half = len / 2;
+    let mut result = String::new();
+
+    // First part: from (half - 5) to 0, stepping backwards by 2
+    let mut i = if half >= 5 { half - 5 } else { 0 };
+    while i < len {
+        // Ensure we don't go out of bounds
+        if let Some(c) = s.chars().nth(i) {
+            result.push(c);
+        }
+        if i < 2 {
+            break;
+        } // Prevent underflow
+        i -= 2;
+    }
+
+    // Second part: from (half + 4) to end, stepping by 2
+    let mut i = half + 4;
+    while i < len {
+        if let Some(c) = s.chars().nth(i) {
+            result.push(c);
+        }
+        i += 2;
+    }
+
+    result
+}
+
+fn extract_magnet_link(html: &str) -> Result<String, String> {
+    // Look for the magnetLink variable in the JavaScript
+    let re =
+        Regex::new(r#"let magnetLink = "([^"]+)""#).map_err(|e| format!("Regex error: {}", e))?;
+
+    re.captures(html)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+        .ok_or_else(|| "Magnet link not found in JavaScript".to_string())
+}
+
+#[tauri::command]
 async fn find_and_get_game_details(query: String) -> Result<Option<GameDetails>, String> {
     // Lock the global Steam game store and perform a fuzzy search
     let game_store = STEAM_GAME_STORE.lock().await;
@@ -252,6 +440,12 @@ pub fn run() {
             }
         }
 
+        let mut global_store = STEAM_GAME_STORE_INDEX.lock().await;
+        global_store
+            .load_games("games_index.json")
+            .await
+            .expect("Failed to load steam games");
+
         // Initialize torrent manager with platform-specific download directory
         let downloads_dir = if cfg!(target_os = "windows") {
             format!(
@@ -301,9 +495,18 @@ pub fn run() {
             set_defender_exclusion_status,
             drop_torrent,
             uninstall_game,
+            search_igggames,
+            download_igggames,
+            fetch_games_index,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[tauri::command]
+async fn fetch_games_index(category: String, page: usize, page_size: usize) -> Vec<SteamGame> {
+    let store = STEAM_GAME_STORE_INDEX.lock().await;
+    store.get_games(&category, page, page_size).await
 }
 
 #[tauri::command]
@@ -537,8 +740,78 @@ async fn uninstall_game(game_path: String) -> Result<(), String> {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct SearchResult {
+    title: String,
+    url: String,
+    source: String,
+}
+
 #[tauri::command]
-async fn search_online_fix(query: String) -> Result<Vec<String>, String> {
+async fn search_igggames(query: String) -> Result<Vec<SearchResult>, String> {
+    let client = Client::new();
+    let url = format!("https://pcgamestorrents.com/?s={}", query.replace(' ', "+"));
+
+    match client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36")
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.text().await {
+                    Ok(html) => {
+                        let document = Html::parse_document(&html);
+
+                        // Selector for each search result article
+                        let article_selector = Selector::parse("article").unwrap();
+                        // Selector for title within the article
+                        let title_selector = Selector::parse(".uk-article-title").unwrap();
+                        // Selector for URL within the article
+                        let link_selector = Selector::parse("a.uk-link-reset").unwrap();
+
+                        let mut results = Vec::new();
+
+                        for element in document.select(&article_selector) {
+                            if let Some(title_element) = element.select(&title_selector).next() {
+                                if let Some(link_element) = element.select(&link_selector).next() {
+                                    if let Some(href) = link_element.value().attr("href") {
+                                        // Extract and clean the title text
+                                        let title = title_element.text().collect::<String>()
+                                            .trim()
+                                            .replace('\u{201c}', "")  // Remove left double quote
+                                            .replace('\u{201d}', "")  // Remove right double quote
+                                            .to_string();
+
+                                        results.push(SearchResult {
+                                            title,
+                                            url: href.to_string(),
+                                            source: "igggames".to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        if results.is_empty() {
+                            Err("No search results found".into())
+                        } else {
+                            Ok(results)
+                        }
+                    }
+                    Err(err) => Err(format!("Failed to read response: {}", err)),
+                }
+            } else {
+                Err(format!("HTTP error: {}", response.status()))
+            }
+        }
+        Err(err) => Err(format!("Request failed: {}", err)),
+    }
+}
+
+#[tauri::command]
+async fn search_online_fix(query: String) -> Result<Vec<SearchResult>, String> {
     let client = Client::new();
     let url = "https://online-fix.me/engine/ajax/search.php";
 
@@ -575,7 +848,7 @@ async fn search_online_fix(query: String) -> Result<Vec<String>, String> {
                         let selector = Selector::parse("span.searchheading").unwrap();
 
                         // Extract the text content and apply the modification
-                        let results: Vec<String> = document
+                        let results: Vec<SearchResult> = document
                             .select(&selector)
                             .filter_map(|element| element.text().next().map(|text| {
                                 let mut title = text.trim().to_string();
@@ -588,7 +861,7 @@ async fn search_online_fix(query: String) -> Result<Vec<String>, String> {
                                         .collect::<String>();
                                 }
 
-                                title
+                                SearchResult { title: title, url: "none".to_string(), source: "online-fix".to_string() }
                             }))
                             .collect();
 

@@ -3,6 +3,8 @@ use scraper::{Html, Selector};
 use serde::Serialize;
 use std::error::Error;
 
+use crate::STEAM_GAME_STORE_INDEX;
+
 #[derive(Serialize)]
 pub struct Game {
     pub title: String,
@@ -51,7 +53,10 @@ pub fn scrape_games(page: usize) -> Result<Vec<Game>, Box<dyn Error>> {
 
         // Remove the last 7 characters (safely for UTF-8)
         let title = if title.chars().count() > 8 {
-            title.chars().take(title.chars().count() - 8).collect::<String>()
+            title
+                .chars()
+                .take(title.chars().count() - 8)
+                .collect::<String>()
         } else {
             title
         };

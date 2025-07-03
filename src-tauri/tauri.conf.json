@@ -25,7 +25,8 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "steam_games.json"
+      "steam_games.json",
+      "games_index.json"
     ],
     "icon": [
       "icons/pico_32x32_rgba.png",
